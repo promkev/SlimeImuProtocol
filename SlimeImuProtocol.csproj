@@ -3,8 +3,11 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
+    <Nullable>disable</Nullable>
     <Configurations>Debug;Release;Release-Phone;Release-Quest</Configurations>
+    <!-- Legacy code predates nullable reference types; silence the common unused-field /
+         discard-result warnings that are not actionable here. -->
+    <NoWarn>$(NoWarn);CS0168;CS0169;CS0219;CS0414;CS0642;CS0649;CS4014;CS8632</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
