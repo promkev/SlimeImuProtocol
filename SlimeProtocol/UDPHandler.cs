@@ -11,7 +11,9 @@ namespace SlimeImuProtocol.SlimeVR
     public class UDPHandler : IDisposable
     {
         private static string _endpoint = "255.255.255.255";
-        private static bool _handshakeOngoing = false;
+        // 0 = idle, 1 = handshake in progress. Serialized via Interlocked.CompareExchange to
+        // prevent two handlers from racing into simultaneous discovery.
+        private static int _handshakeOngoingFlag = 0;
         public static event EventHandler OnForceHandshake;
         public static event EventHandler OnForceDestroy;
         public static event EventHandler<string> OnServerDiscovered;
@@ -35,16 +37,48 @@ namespace SlimeImuProtocol.SlimeVR
         private CancellationTokenSource _cts = new CancellationTokenSource();
         public bool IsDiscoveryOnly { get; set; } = false;
 
-        // Packet telemetry counters surfaced to callers (UI / diagnostics). Stubs for now —
-        // the current WatchdogLoop does not wire them; plumb through the send paths if
-        // detailed metrics are needed later.
-        public long PacketsSent => 0;
-        public long SendFailures => 0;
+        // Packet telemetry counters surfaced to callers (UI / diagnostics). Incremented in
+        // every SendAsync path via SendInternal; ServerReachable reflects handshake success +
+        // absence of recent send failures.
+        private long _packetsSent;
+        private long _sendFailures;
+        public long PacketsSent => System.Threading.Interlocked.Read(ref _packetsSent);
+        public long SendFailures => System.Threading.Interlocked.Read(ref _sendFailures);
         public bool ServerReachable => _isInitialized;
+
+        /// <summary>
+        /// Unified send path. Counts success/failure so UI diagnostics don't lie. Callers use
+        /// this instead of udpClient.SendAsync directly.
+        /// </summary>
+        private async Task SendInternal(ReadOnlyMemory<byte> payload)
+        {
+            try
+            {
+                await udpClient.SendAsync(payload);
+                System.Threading.Interlocked.Increment(ref _packetsSent);
+            }
+            catch
+            {
+                System.Threading.Interlocked.Increment(ref _sendFailures);
+            }
+        }
+
+        private async Task SendInternal(byte[] payload)
+        {
+            try
+            {
+                await udpClient.SendAsync(payload, payload.Length);
+                System.Threading.Interlocked.Increment(ref _packetsSent);
+            }
+            catch
+            {
+                System.Threading.Interlocked.Increment(ref _sendFailures);
+            }
+        }
 
         public bool Active { get => _active; set => _active = value; }
         public static string Endpoint { get => _endpoint; set => _endpoint = value; }
-        public static bool HandshakeOngoing { get => _handshakeOngoing; }
+        public static bool HandshakeOngoing => System.Threading.Volatile.Read(ref _handshakeOngoingFlag) != 0;
 
         /// <summary>
         /// Force the handshake state machine to re-run. Safe no-op if already initializing.
@@ -106,8 +140,9 @@ namespace SlimeImuProtocol.SlimeVR
 
                 if (!_isInitialized)
                 {
-                    // Sequential Handshake Logic (Global Mutex)
-                    while (_handshakeOngoing && !disposed)
+                    // Sequential handshake — one handler at a time. Atomic CAS prevents two
+                    // handlers racing into discovery simultaneously (prior bool flag raced).
+                    while (System.Threading.Interlocked.CompareExchange(ref _handshakeOngoingFlag, 1, 0) != 0 && !disposed)
                     {
                         await Task.Delay(1000);
                     }
@@ -116,7 +151,6 @@ namespace SlimeImuProtocol.SlimeVR
 
                     try
                     {
-                        _handshakeOngoing = true;
                         Debug.WriteLine($"[UDPHandler] Starting Handshake for {_id}...");
 
                         while (!_isInitialized && _active && !disposed)
@@ -127,7 +161,7 @@ namespace SlimeImuProtocol.SlimeVR
                                 ConfigureUdp();
                             }
 
-                            await udpClient.SendAsync(packetBuilder.BuildHandshakePacket(boardType, imuType, mcuType, magnetometerStatus, hardwareAddress));
+                            await SendInternal(packetBuilder.BuildHandshakePacket(boardType, imuType, mcuType, magnetometerStatus, hardwareAddress));
                             await Task.Delay(1000);
                         }
                     }
@@ -137,7 +171,7 @@ namespace SlimeImuProtocol.SlimeVR
                     }
                     finally
                     {
-                        _handshakeOngoing = false;
+                        System.Threading.Interlocked.Exchange(ref _handshakeOngoingFlag, 0);
                     }
 
                     if (_isInitialized)
@@ -145,8 +179,17 @@ namespace SlimeImuProtocol.SlimeVR
                         Debug.WriteLine($"[UDPHandler] Handshake Success for {_id}. Sending sensor info...");
                         for (int i = 0; i < _supportedSensorCount; i++)
                         {
-                            await udpClient.SendAsync(packetBuilder.BuildSensorInfoPacket(imuType, TrackerPosition.NONE, TrackerDataType.ROTATION, (byte)i));
+                            await SendInternal(packetBuilder.BuildSensorInfoPacket(imuType, TrackerPosition.NONE, TrackerDataType.ROTATION, (byte)i));
                         }
+
+                        // Advertise supported protocol features so the server knows it can use
+                        // bundled packets for us. Without this, the server falls back to
+                        // single-packet-per-datagram mode even if we send bundles ourselves.
+                        try
+                        {
+                            await SendInternal(packetBuilder.BuildFeatureFlagsPacket(UDPPackets.FeatureFlagBits.PROTOCOL_BUNDLE_SUPPORT));
+                        }
+                        catch (Exception ex) { Debug.WriteLine($"[UDPHandler] FeatureFlags send failed: {ex.Message}"); }
 
                         if (IsDiscoveryOnly)
                         {
@@ -189,34 +232,35 @@ namespace SlimeImuProtocol.SlimeVR
                     byte[] buffer = result.Buffer;
                     if (buffer.Length == 0) continue;
 
-                    // Header check for handshake reply
-                    string value = Encoding.UTF8.GetString(buffer);
-                    if (value.Contains("Hey OVR =D 5"))
+                    // Parse packet type from first 4 bytes (big-endian int32). Handshake reply
+                    // uses the same type as the outgoing request (RECEIVE_HANDSHAKE=3) followed
+                    // by a version string payload. Relying on the type first is robust against
+                    // the server changing its version string ("Hey OVR =D 5" etc).
+                    uint packetType = buffer.Length >= 4
+                        ? (uint)((buffer[0] << 24) | (buffer[1] << 16) | (buffer[2] << 8) | buffer[3])
+                        : uint.MaxValue;
+
+                    bool looksLikeHandshakeAscii =
+                        packetType == UDPPacketsIn.RECEIVE_HANDSHAKE
+                        || (buffer.Length >= 12 && Encoding.ASCII.GetString(buffer, 0, Math.Min(buffer.Length, 16)).Contains("Hey OVR"));
+
+                    if (looksLikeHandshakeAscii && !_isInitialized)
                     {
-                        if (!_isInitialized)
-                        {
-                            _endpoint = result.RemoteEndPoint.Address.ToString();
-                            udpClient.Connect(_endpoint, 6969);
-                            _isInitialized = true;
-                            Debug.WriteLine($"[UDPHandler] Got Discovery Response for {_id}: {_endpoint}");
-                            OnServerDiscovered?.Invoke(null, _endpoint);
-                        }
+                        _endpoint = result.RemoteEndPoint.Address.ToString();
+                        udpClient.Connect(_endpoint, 6969);
+                        _isInitialized = true;
+                        Debug.WriteLine($"[UDPHandler] Got Discovery Response for {_id}: {_endpoint}");
+                        OnServerDiscovered?.Invoke(null, _endpoint);
                         continue;
                     }
 
-                    // Standard SlimeVR Packets (Type in first 4 bytes, Big Endian)
-                    if (buffer.Length >= 4)
+                    if (packetType == UDPPackets.PING_PONG)
                     {
-                        uint packetType = (uint)((buffer[0] << 24) | (buffer[1] << 16) | (buffer[2] << 8) | buffer[3]);
-
-                        if (packetType == 10) // PingPong
-                        {
-                            await udpClient.SendAsync(buffer, buffer.Length); // Echo back
-                        }
-                        else if (packetType == 1) // Server Heartbeat
-                        {
-                            await udpClient.SendAsync(packetBuilder.CreateHeartBeat()); // Reply with our heartbeat
-                        }
+                        await SendInternal(buffer); // echo same buffer back
+                    }
+                    else if (packetType == UDPPacketsIn.RECEIVE_HEARTBEAT)
+                    {
+                        await SendInternal(packetBuilder.CreateHeartBeat());
                     }
                 }
                 catch (Exception ex) when (!disposed)
@@ -233,11 +277,7 @@ namespace SlimeImuProtocol.SlimeVR
             {
                 if (_active && _isInitialized)
                 {
-                    try
-                    {
-                        await udpClient.SendAsync(packetBuilder.CreateHeartBeat());
-                    }
-                    catch { }
+                    await SendInternal(packetBuilder.CreateHeartBeat());
                 }
                 await Task.Delay(900);
             }
@@ -267,7 +307,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                await udpClient.SendAsync(packetBuilder.BuildRotationPacket(rotation, trackerId));
+                await SendInternal(packetBuilder.BuildRotationPacket(rotation, trackerId));
                 _lastQuaternion = rotation;
             }
             return true;
@@ -286,7 +326,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                await udpClient.SendAsync(packetBuilder.BuildAccelerationPacket(acceleration, trackerId));
+                await SendInternal(packetBuilder.BuildAccelerationPacket(acceleration, trackerId));
                 _timeSinceLastAccelerationDataPacket.Restart();
                 _lastAccelerationPacket = acceleration;
             }
@@ -297,7 +337,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                await udpClient.SendAsync(packetBuilder.BuildThumbstickPacket(analogueThumbstick, trackerId));
+                await SendInternal(packetBuilder.BuildThumbstickPacket(analogueThumbstick, trackerId));
             }
             return true;
         }
@@ -306,7 +346,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                await udpClient.SendAsync(packetBuilder.BuildTriggerAnaloguePacket(triggerAnalogue, trackerId));
+                await SendInternal(packetBuilder.BuildTriggerAnaloguePacket(triggerAnalogue, trackerId));
             }
             return true;
         }
@@ -315,7 +355,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                await udpClient.SendAsync(packetBuilder.BuildGripAnaloguePacket(gripAnalogue, trackerId));
+                await SendInternal(packetBuilder.BuildGripAnaloguePacket(gripAnalogue, trackerId));
             }
             return true;
         }
@@ -324,7 +364,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                await udpClient.SendAsync(packetBuilder.BuildGyroPacket(gyro, trackerId));
+                await SendInternal(packetBuilder.BuildGyroPacket(gyro, trackerId));
             }
             return true;
         }
@@ -332,7 +372,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                await udpClient.SendAsync(packetBuilder.BuildFlexDataPacket(flexResistance, trackerId));
+                await SendInternal(packetBuilder.BuildFlexDataPacket(flexResistance, trackerId));
             }
             return true;
         }
@@ -340,7 +380,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                await udpClient.SendAsync(packetBuilder.BuildButtonPushedPacket(userActionType));
+                await SendInternal(packetBuilder.BuildButtonPushedPacket(userActionType));
             }
             return true;
         }
@@ -348,7 +388,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                await udpClient.SendAsync(packetBuilder.BuildControllerButtonPushedPacket(userActionType, trackerId));
+                await SendInternal(packetBuilder.BuildControllerButtonPushedPacket(userActionType, trackerId));
             }
             return true;
         }
@@ -357,7 +397,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                await udpClient.SendAsync(packet);
+                await SendInternal(packet);
             }
             return true;
         }
@@ -366,7 +406,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                await udpClient.SendAsync(packetBuilder.BuildBatteryLevelPacket(battery, voltage));
+                await SendInternal(packetBuilder.BuildBatteryLevelPacket(battery, voltage));
             }
             return true;
         }
@@ -375,7 +415,22 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                await udpClient.SendAsync(packetBuilder.BuildMagnetometerPacket(magnetometer, trackerId));
+                await SendInternal(packetBuilder.BuildMagnetometerPacket(magnetometer, trackerId));
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Sends N packets as one BUNDLE datagram (type 100). Use when emitting multiple
+        /// related updates per tick (e.g. rotation + accel + battery) — saves syscalls and UDP
+        /// header overhead. Server must support PROTOCOL_BUNDLE_SUPPORT (advertised via
+        /// FEATURE_FLAGS automatically after handshake).
+        /// </summary>
+        public async Task<bool> SendBundle(params ReadOnlyMemory<byte>[] innerPackets)
+        {
+            if (udpClient != null && _isInitialized && innerPackets != null && innerPackets.Length > 0)
+            {
+                await SendInternal(packetBuilder.BuildBundlePacket(innerPackets));
             }
             return true;
         }
@@ -388,7 +443,7 @@ namespace SlimeImuProtocol.SlimeVR
                 {
                     disposed = true;
                     _isInitialized = false;
-                    _handshakeOngoing = false;
+                    System.Threading.Interlocked.Exchange(ref _handshakeOngoingFlag, 0);
                     udpClient?.Close();
                     udpClient?.Dispose();
                     udpClient = null;
@@ -401,7 +456,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                _ = udpClient.SendAsync(packetBuilder.BuildTriggerAnaloguePacket(trigger, trackerId));
+                _ = SendInternal(packetBuilder.BuildTriggerAnaloguePacket(trigger, trackerId));
             }
         }
 
@@ -409,7 +464,7 @@ namespace SlimeImuProtocol.SlimeVR
         {
             if (udpClient != null && _isInitialized)
             {
-                _ = udpClient.SendAsync(packetBuilder.BuildGripAnaloguePacket(grip, trackerId));
+                _ = SendInternal(packetBuilder.BuildGripAnaloguePacket(grip, trackerId));
             }
         }
     }
