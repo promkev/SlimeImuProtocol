@@ -60,16 +60,19 @@ namespace SlimeImuProtocol.Utility
             Vector3 currentNormalized = Vector3.Normalize(from);
             Vector3 targetNormalized = Vector3.Normalize(to);
 
-            // Calculate the rotation axis
             Vector3 rotationAxis = Vector3.Cross(currentNormalized, targetNormalized);
+            float axisLength = rotationAxis.Length();
+            if (axisLength < 1e-6f)
+            {
+                // Parallel or anti-parallel vectors: either identity or 180Â° rotation.
+                return Quaternion.Identity;
+            }
+            rotationAxis /= axisLength;
 
-            // Calculate the angle between the vectors
-            float angle = (float)Math.Acos(Vector3.Dot(currentNormalized, targetNormalized));
+            float dot = Math.Clamp(Vector3.Dot(currentNormalized, targetNormalized), -1f, 1f);
+            float angle = (float)Math.Acos(dot);
 
-            // Create the quaternion from the axis and angle
-            Quaternion rotationQuaternion = Quaternion.CreateFromAxisAngle(rotationAxis, angle);
-
-            return rotationQuaternion;
+            return Quaternion.CreateFromAxisAngle(rotationAxis, angle);
         }
 
         public static Quaternion LookAt(Vector3 position, Vector3 target)
@@ -78,6 +81,12 @@ namespace SlimeImuProtocol.Utility
             Matrix4x4 viewMatrix = Matrix4x4.CreateLookTo(position, new Vector3(value.X, value.Y, value.Z * -1), Vector3.UnitY);
             return Quaternion.CreateFromRotationMatrix(viewMatrix);
         }
+        /// <summary>
+        /// Returns Euler angles in DEGREES (X=roll, Y=pitch, Z=yaw). Despite the name,
+        /// output is converted to degrees at the end.
+        /// </summary>
+        public static Vector3 QuaternionToEulerDegrees(this Quaternion q) => QuaternionToEuler(q);
+
         public static Vector3 QuaternionToEuler(this Quaternion q)
         {
             Vector3 angles = new Vector3();
@@ -121,7 +130,7 @@ namespace SlimeImuProtocol.Utility
 
             float yaw = 0;
             float roll = 0;
-            // Check for gimbal lock (pitch = ±90 degrees)
+            // Check for gimbal lock (pitch = ï¿½90 degrees)
             if (MathF.Abs(pitch) >= MathF.PI / 2)
             {
                 yaw = MathF.Atan2(q.Y, q.W);
