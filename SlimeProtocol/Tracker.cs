@@ -19,8 +19,6 @@ namespace SlimeImuProtocol.SlimeProtocol {
         public bool UsesTimeout { get; set; }
         public MagnetometerStatus MagStatus { get; set; }
 
-        private FunctionSequenceManager _functionSequenceManager;
-
         public float BatteryLevel {
             get => _batteryLevel;
             set
@@ -32,7 +30,7 @@ namespace SlimeImuProtocol.SlimeProtocol {
                 }
             }
         }
-        public float BatteryVoltage { get; set; }
+        public float BatteryVoltage { get; set; } = 3.7f;
         public float? Temperature { get; set; }
         public int SignalStrength { get; set; }
 
@@ -67,15 +65,22 @@ namespace SlimeImuProtocol.SlimeProtocol {
             NeedsMounting = needsMounting;
             UsesTimeout = usesTimeout;
             MagStatus = magStatus;
+
             var token = _cts.Token;
-            Task.Run(() => {
-                while (device.FirmwareVersion == null && !token.IsCancellationRequested) {
-                    Thread.Sleep(1000);
+            Task.Run(async () => {
+                // Bounded wait: 60 s ceiling so a device that never publishes firmware cannot
+                // keep this task (and its UDPHandler construction) pinned forever.
+                const int maxWaitMs = 60000;
+                int elapsed = 0;
+                while (device.FirmwareVersion == null) {
+                    if (token.IsCancellationRequested) return;
+                    try { await Task.Delay(250, token); } catch (OperationCanceledException) { return; }
+                    elapsed += 250;
+                    if (elapsed >= maxWaitMs) return;
                 }
                 if (token.IsCancellationRequested) return;
-
-                _udpHandler = new UDPHandler(device.FirmwareVersion + "_EsbToLan", 
-                 Encoding.UTF8.GetBytes(device.HardwareIdentifier), device.BoardType, 
+                _udpHandler = new UDPHandler(device.FirmwareVersion + "_EsbToLan",
+                 Encoding.UTF8.GetBytes(device.HardwareIdentifier), device.BoardType,
                  ImuType, device.McuType, MagStatus, 1);
                 _ready = true;
             }, token);
@@ -119,14 +124,11 @@ namespace SlimeImuProtocol.SlimeProtocol {
             }
         }
 
-        public async Task DataTick() {
-            // What do?
-        }
-
         public void Dispose() {
              _ready = false;
-             _cts.Cancel();
+             try { _cts.Cancel(); } catch { }
              _udpHandler?.Dispose();
+             _cts.Dispose();
         }
     }
 

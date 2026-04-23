@@ -75,7 +75,8 @@ namespace SlimeImuProtocol.SlimeProtocol
         }
         public Vector3 SmoothRotation { get; set; }
 
-        public Vector3 Euler { get => _eulerCalibration - _euler; set => _euler = value; }
+        public Vector3 Euler { get => _euler; set => _euler = value; }
+        public Vector3 CalibratedEuler { get => _eulerCalibration - _euler; }
         public Vector3 EulerCalibration { get => _eulerCalibration; set => _eulerCalibration = value; }
         public Vector3 Position { get => _position; set => _position = value; }
         public Vector3 PositionCalibration { get => _positionCalibration; set => _positionCalibration = value; }
