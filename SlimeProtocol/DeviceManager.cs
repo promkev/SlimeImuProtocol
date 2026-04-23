@@ -1,26 +1,20 @@
 ﻿namespace SlimeImuProtocol.SlimeProtocol {
     public class DeviceManager {
-        private static DeviceManager _instance = new DeviceManager();
-        Dictionary<string, TrackerDevice> _devices = new Dictionary<string, TrackerDevice>();
+        private static readonly DeviceManager _instance = new DeviceManager();
+        private readonly Dictionary<string, TrackerDevice> _devices = new Dictionary<string, TrackerDevice>();
         private int _nextLocalTrackerId;
 
-        public static DeviceManager Instance {
-            get {
-                if (_instance == null) {
-                    _instance = new DeviceManager();
-                }
-                return _instance;
-            }
-        }
-        public DeviceManager() {
-            _instance = this;
-        }
+        public static DeviceManager Instance => _instance;
+
+        private DeviceManager() { }
 
         public void AddDevice(TrackerDevice newDevice) {
-            _devices[newDevice.HardwareIdentifier] = newDevice;
+            lock (_devices) {
+                _devices[newDevice.HardwareIdentifier] = newDevice;
+            }
         }
         public int GetNextLocalTrackerId() {
-            return ++_nextLocalTrackerId;
+            return Interlocked.Increment(ref _nextLocalTrackerId);
         }
     }
 }
