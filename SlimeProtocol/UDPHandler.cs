@@ -35,9 +35,21 @@ namespace SlimeImuProtocol.SlimeVR
         private CancellationTokenSource _cts = new CancellationTokenSource();
         public bool IsDiscoveryOnly { get; set; } = false;
 
+        // Packet telemetry counters surfaced to callers (UI / diagnostics). Stubs for now —
+        // the current WatchdogLoop does not wire them; plumb through the send paths if
+        // detailed metrics are needed later.
+        public long PacketsSent => 0;
+        public long SendFailures => 0;
+        public bool ServerReachable => _isInitialized;
+
         public bool Active { get => _active; set => _active = value; }
         public static string Endpoint { get => _endpoint; set => _endpoint = value; }
         public static bool HandshakeOngoing { get => _handshakeOngoing; }
+
+        /// <summary>
+        /// Force the handshake state machine to re-run. Safe no-op if already initializing.
+        /// </summary>
+        public void Rehandshake() => TriggerHandshake();
 
         public UDPHandler(string firmware, byte[] hardwareAddress, BoardType boardType, ImuType imuType, McuType mcuType, MagnetometerStatus magnetometerStatus, int supportedSensorCount)
         {
