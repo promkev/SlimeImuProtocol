@@ -1,69 +1,90 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace SlimeImuProtocol.Utility
 {
-    public class FunctionSequenceManager
+    public class FunctionSequenceManager : IDisposable
     {
-        private Task _task;
-        private static FunctionSequenceManager _instance;
-        private Dictionary<string, EventHandler> _functionQueue = new Dictionary<string, EventHandler>();
+        private readonly Task _task;
+        private readonly CancellationTokenSource _cts = new CancellationTokenSource();
+        private static readonly Lazy<FunctionSequenceManager> _lazy = new Lazy<FunctionSequenceManager>(() => new FunctionSequenceManager(), LazyThreadSafetyMode.ExecutionAndPublication);
+        private readonly Dictionary<string, EventHandler> _functionQueue = new Dictionary<string, EventHandler>();
         private static int _packetsAllowedPerSecond = 1000;
-        public static FunctionSequenceManager Instance { get => _instance; set => _instance = value; }
+        public static FunctionSequenceManager Instance => _lazy.Value;
         public static int PacketsAllowedPerSecond { get => _packetsAllowedPerSecond; set => _packetsAllowedPerSecond = value; }
 
-        public FunctionSequenceManager()
+        private FunctionSequenceManager()
         {
-            _instance = this;
-            _task = Task.Run(() =>
+            var token = _cts.Token;
+            _task = Task.Run(() => RunLoop(token), token);
+        }
+
+        private void RunLoop(CancellationToken token)
+        {
+            var pending = new List<KeyValuePair<string, EventHandler>>();
+            while (!token.IsCancellationRequested)
             {
-                while (true)
+                try
                 {
-                    try
+                    pending.Clear();
+                    lock (_functionQueue)
                     {
-                        lock (_functionQueue)
+                        if (_functionQueue.Count > 0)
                         {
-                            if (_functionQueue.Count > 0)
+                            foreach (var kvp in _functionQueue)
                             {
-                                for (int i = 0; i < _functionQueue.Keys.Count; i++)
+                                if (kvp.Value != null)
                                 {
-                                    string key = _functionQueue.Keys.ElementAt(i);
-                                    if (key != null)
-                                    {
-                                        if (_functionQueue[key] != null)
-                                        {
-                                            _functionQueue[key].Invoke(this, EventArgs.Empty);
-                                            _functionQueue[key] = null;
-                                            if (PacketsAllowedPerSecond > 0)
-                                            {
-                                                Thread.Sleep(1000 / _packetsAllowedPerSecond);
-                                            }
-                                        }
-                                    }
+                                    pending.Add(kvp);
                                 }
                             }
-                            else
-                            {
-                                Thread.Sleep(100);
-                            }
-                            Console.WriteLine("Cycled through " + _functionQueue.Keys.Count + " messages this cycle.");
                             _functionQueue.Clear();
                         }
                     }
-                    catch (Exception ex)
+
+                    if (pending.Count == 0)
                     {
-                        Console.WriteLine(ex.ToString());
+                        try { Task.Delay(100, token).Wait(token); } catch (OperationCanceledException) { return; }
+                        continue;
+                    }
+
+                    int sleepMs = _packetsAllowedPerSecond > 0 ? 1000 / _packetsAllowedPerSecond : 0;
+                    foreach (var kvp in pending)
+                    {
+                        if (token.IsCancellationRequested) return;
+                        try { kvp.Value?.Invoke(this, EventArgs.Empty); } catch { }
+                        if (sleepMs > 0)
+                        {
+                            try { Task.Delay(sleepMs, token).Wait(token); } catch (OperationCanceledException) { return; }
+                        }
                     }
                 }
-            });
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch
+                {
+                    // swallow - keep loop alive
+                }
+            }
         }
+
         public void AddFunctionToQueue(string id, EventHandler function)
         {
             lock (_functionQueue)
             {
                 _functionQueue[id] = function;
             }
+        }
+
+        public void Dispose()
+        {
+            try { _cts.Cancel(); } catch { }
+            try { _task?.Wait(500); } catch { }
+            _cts.Dispose();
         }
     }
 }
