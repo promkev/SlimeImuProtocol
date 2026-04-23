@@ -37,11 +37,8 @@ namespace SlimeImuProtocol.SlimeVR
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
         private long NextPacketId()
         {
-            if (_packetId >= long.MaxValue)
-            {
-                _packetId = 0;
-            }
-            return _packetId++;
+            // Atomic increment: rotation/accel/heartbeat/haptic packets are sent from concurrent Tasks.
+            return System.Threading.Interlocked.Increment(ref _packetId) - 1;
         }
 
         public ReadOnlyMemory<byte> CreateHeartBeat()
@@ -159,14 +156,20 @@ namespace SlimeImuProtocol.SlimeVR
             return _buttonBuffer.AsMemory(0, w.Position);
         }
 
-        public ReadOnlyMemory<byte> BuildBatteryLevelPacket(float battery, float voltage)
+        /// <summary>
+        /// Builds a BATTERY_LEVEL packet for the SlimeVR server.
+        /// Wire layout: header(4) + packetId(8) + voltage(float,volts) + level(float, 0..1).
+        /// </summary>
+        /// <param name="batteryPercent">Battery percentage in 0..100 range.</param>
+        /// <param name="voltageVolts">Battery voltage in volts (e.g. 3.7). Pass a sane default if unknown — zero hides the indicator in SlimeVR UI.</param>
+        public ReadOnlyMemory<byte> BuildBatteryLevelPacket(float batteryPercent, float voltageVolts)
         {
             var w = new BigEndianWriter(_batteryBuffer);
             w.SetPosition(0);
-            w.WriteInt32((int)UDPPackets.BATTERY_LEVEL); // Header
-            w.WriteInt64(NextPacketId()); // Packet counter
-            w.WriteSingle(voltage); // Battery data
-            w.WriteSingle(battery / 100f); // Battery data
+            w.WriteInt32((int)UDPPackets.BATTERY_LEVEL);
+            w.WriteInt64(NextPacketId());
+            w.WriteSingle(voltageVolts <= 0.1f ? 3.7f : voltageVolts);
+            w.WriteSingle(Math.Clamp(batteryPercent / 100f, 0f, 1f));
             return _batteryBuffer.AsMemory(0, w.Position);
         }
 
@@ -174,12 +177,10 @@ namespace SlimeImuProtocol.SlimeVR
         {
             var w = new BigEndianWriter(_hapticBuffer);
             w.SetPosition(0);
-            w.WriteByte(0); // Padding
-            w.WriteByte(0); // Padding
-            w.WriteByte(0); // Padding
-            w.WriteByte((byte)UDPPackets.HAPTICS); // Header
-            w.WriteSingle(intensity); // Vibration Intensity
-            w.WriteInt32(duration); // Haptic Duration
+            w.WriteInt32((int)UDPPackets.HAPTICS); // full-width header like every other packet
+            w.WriteInt64(NextPacketId());
+            w.WriteSingle(intensity);
+            w.WriteInt32(duration);
             w.WriteByte(1); // active
             return _hapticBuffer.AsMemory(0, w.Position);
         }
@@ -196,9 +197,11 @@ namespace SlimeImuProtocol.SlimeVR
             w.WriteInt32((int)boardType); // Board type
             w.WriteInt32((int)imuType); // IMU type
             w.WriteInt32((int)mcuType); // MCU Type
-            w.WriteInt32((int)magStatus); // IMU Info
-            w.WriteInt32((int)magStatus); // IMU Info
-            w.WriteInt32((int)magStatus); // IMU Info
+            // SlimeVR firmware layout here is 3 × int32 "IMU Info" slots. For a single-sensor
+            // tracker the first slot holds magnetometer status and the rest are reserved/zero.
+            w.WriteInt32((int)magStatus); // IMU Info slot 1 (magnetometer status)
+            w.WriteInt32(0);              // IMU Info slot 2 (reserved)
+            w.WriteInt32(0);              // IMU Info slot 3 (reserved)
             w.WriteInt32(_protocolVersion); // Protocol Version
 
             // Identifier string
@@ -260,6 +263,71 @@ namespace SlimeImuProtocol.SlimeVR
             w.WriteSingle(gripAnalogue); // Euler X
             w.WriteByte(trackerId); // Tracker id
             return _gripAnalogueBuffer.AsMemory(0, w.Position);
+        }
+
+        /// <summary>
+        /// FEATURE_FLAGS packet (type 22). Advertises tracker-side capabilities to the server.
+        /// Layout: header(4) + packetId(8) + flagBytes(variable, LSB0 bit order).
+        /// Bit 0 = PROTOCOL_BUNDLE_SUPPORT. Other bits reserved.
+        /// </summary>
+        public byte[] BuildFeatureFlagsPacket(params int[] enabledFlagBits)
+        {
+            int maxBit = 0;
+            foreach (var b in enabledFlagBits) if (b > maxBit) maxBit = b;
+            int flagByteCount = Math.Max(1, (maxBit / 8) + 1);
+
+            var buf = new byte[4 + 8 + flagByteCount];
+            var w = new BigEndianWriter(buf);
+            w.SetPosition(0);
+            w.WriteInt32((int)UDPPackets.FEATURE_FLAGS);
+            w.WriteInt64(NextPacketId());
+            foreach (var bit in enabledFlagBits)
+            {
+                int byteIdx = bit / 8;
+                int bitIdx = bit % 8;
+                buf[12 + byteIdx] |= (byte)(1 << bitIdx);
+            }
+            return buf;
+        }
+
+        /// <summary>
+        /// PING_PONG packet (type 10) echo. Server sends ping with a challenge ID; tracker
+        /// echoes same ID back verbatim. Fixes latency display in SlimeVR dashboard.
+        /// Layout: header(4) + packetId(8) + pingId(4).
+        /// </summary>
+        public byte[] BuildPingPongPacket(int pingId)
+        {
+            var buf = new byte[4 + 8 + 4];
+            var w = new BigEndianWriter(buf);
+            w.SetPosition(0);
+            w.WriteInt32((int)UDPPackets.PING_PONG);
+            w.WriteInt64(NextPacketId());
+            w.WriteInt32(pingId);
+            return buf;
+        }
+
+        /// <summary>
+        /// BUNDLE packet (type 100). Wraps N inner packets in one datagram, each prefixed with
+        /// uint16 length. Requires server to advertise PROTOCOL_BUNDLE_SUPPORT via FEATURE_FLAGS.
+        /// Saves syscall + UDP header overhead at high send rates (e.g. rotation+accel+battery).
+        /// </summary>
+        public byte[] BuildBundlePacket(params ReadOnlyMemory<byte>[] innerPackets)
+        {
+            int total = 4 + 8; // bundle header + packet id
+            foreach (var p in innerPackets) total += 2 + p.Length; // uint16 length + payload
+
+            var buf = new byte[total];
+            var w = new BigEndianWriter(buf);
+            w.SetPosition(0);
+            w.WriteInt32((int)UDPPackets.BUNDLE);
+            w.WriteInt64(NextPacketId());
+            foreach (var p in innerPackets)
+            {
+                w.WriteInt16((short)p.Length);
+                p.Span.CopyTo(buf.AsSpan(w.Position));
+                w.Skip(p.Length);
+            }
+            return buf;
         }
     }
 }
