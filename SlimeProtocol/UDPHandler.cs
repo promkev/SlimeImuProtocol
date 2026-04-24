@@ -464,6 +464,22 @@ namespace SlimeImuProtocol.SlimeVR
             return true;
         }
 
+        /// <summary>
+        /// Hot-path convenience: builds ROTATION_DATA + ACCELERATION in one BUNDLE. Saves one
+        /// syscall per IMU sample vs SetSensorRotation + SetSensorAcceleration called
+        /// separately. At 200 Hz × N trackers this halves outbound datagrams.
+        /// </summary>
+        public async Task<bool> SetSensorBundle(Quaternion rotation, Vector3 acceleration, byte trackerId)
+        {
+            if (udpClient == null || !_isInitialized) return true;
+            var rot = packetBuilder.BuildRotationPacket(rotation, trackerId);
+            var acc = packetBuilder.BuildAccelerationPacket(acceleration, trackerId);
+            await SendInternal(packetBuilder.BuildBundlePacket(rot, acc));
+            _lastQuaternion = rotation;
+            _lastAccelerationPacket = acceleration;
+            return true;
+        }
+
         public void Dispose()
         {
             try
