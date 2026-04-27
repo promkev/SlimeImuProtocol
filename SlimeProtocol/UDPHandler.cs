@@ -65,7 +65,7 @@ namespace SlimeImuProtocol.SlimeVR
         /// are non-blocking so the async machinery is pure overhead. Lock protects against
         /// concurrent ConfigureUdp swap. Callers that fire from threads must use this path.
         /// </summary>
-        private void SendInternalSync(byte[] payload)
+        private void SendInternalSync(ReadOnlyMemory<byte> payload)
         {
             if (disposed) return;
             UdpClient client;
@@ -73,7 +73,7 @@ namespace SlimeImuProtocol.SlimeVR
             if (client == null) return;
             try
             {
-                client.Send(payload);
+                client.Send(payload.ToArray());
                 System.Threading.Interlocked.Increment(ref _packetsSent);
             }
             catch
