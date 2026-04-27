@@ -123,6 +123,15 @@ namespace SlimeImuProtocol.SlimeProtocol {
             }
         }
 
+        public void SetBundle(Quaternion rotation, Vector3 acceleration) {
+            if (_ready)
+            {
+                _currentRotation = rotation;
+                _currentAcceleration = acceleration;
+                _udpHandler?.SetSensorBundle(rotation, acceleration, 0);
+            }
+        }
+
         public void SetMagVector(Vector3 m) {
             if (_ready)
             {
