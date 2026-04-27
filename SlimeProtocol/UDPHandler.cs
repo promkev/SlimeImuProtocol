@@ -73,7 +73,9 @@ namespace SlimeImuProtocol.SlimeVR
             if (client == null) return;
             try
             {
-                client.Send(payload.ToArray());
+                // Use the underlying Socket directly to avoid byte[] allocation from ToArray().
+                // Socket.Send(ReadOnlySpan<byte>) is available since .NET Core 2.1.
+                client.Client.Send(payload.Span);
                 System.Threading.Interlocked.Increment(ref _packetsSent);
             }
             catch
