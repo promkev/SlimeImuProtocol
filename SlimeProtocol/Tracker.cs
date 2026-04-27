@@ -4,6 +4,9 @@ using System.Numerics;
 using System.Text;
 using static SlimeImuProtocol.SlimeVR.FirmwareConstants;
 
+using System.Diagnostics;
+using System.Threading;
+
 namespace SlimeImuProtocol.SlimeProtocol {
     public class Tracker : IDisposable {
         public int TrackerNum { get; set; }
@@ -23,9 +26,6 @@ namespace SlimeImuProtocol.SlimeProtocol {
             get => _batteryLevel;
             set
             {
-                // Debounce: only send when level changes more than 1% (0.01 absolute) or
-                // voltage changes more than 0.05V. Avoids packet spam from callers that
-                // update battery every frame.
                 if (MathF.Abs(value - _batteryLevel) < 0.01f) return;
                 _batteryLevel = value;
                 if (_ready)
@@ -46,7 +46,12 @@ namespace SlimeImuProtocol.SlimeProtocol {
         private Vector3 _currentAcceleration;
         private CancellationTokenSource _cts = new CancellationTokenSource();
 
-        // These can be set after construction when device data is parsed
+        // --- Profiling ---
+        private static long _totalSetBundleTicks;
+        private static long _totalSetRotationTicks;
+        private static int _bundleCount;
+        private static int _rotationCount;
+
         public string FirmwareVersion { get; set; }
         public string HardwareIdentifier { get; set; }
         public BoardType BoardType { get; set; }
@@ -71,9 +76,6 @@ namespace SlimeImuProtocol.SlimeProtocol {
             MagStatus = magStatus;
 
             var token = _cts.Token;
-            // Await firmware availability with a 60s ceiling. Still polls since the source
-            // (external TrackerDevice) doesn't expose a FirmwareReady event — but uses
-            // Task.Delay (non-blocking) and respects cancellation so Dispose can unstick it.
             Task.Run(async () => {
                 const int maxWaitMs = 60000;
                 const int pollMs = 250;
@@ -111,7 +113,18 @@ namespace SlimeImuProtocol.SlimeProtocol {
             if (_ready)
             {
                 _currentRotation = q;
-                _udpHandler?.SetSensorRotation(q, 0);
+                var sw = Stopwatch.StartNew();
+                _udpHandler?.SetSensorRotationSync(q, 0);
+                sw.Stop();
+                Interlocked.Add(ref _totalSetRotationTicks, sw.ElapsedTicks);
+                int c = Interlocked.Increment(ref _rotationCount);
+                if (c >= 200)
+                {
+                    double avgMs = (_totalSetRotationTicks / (double)c) / TimeSpan.TicksPerMillisecond;
+                    Console.WriteLine($"[PERF] SetRotationSync avg {avgMs:F3} ms over {c}");
+                    Interlocked.Exchange(ref _totalSetRotationTicks, 0);
+                    Interlocked.Exchange(ref _rotationCount, 0);
+                }
             }
         }
 
@@ -119,7 +132,7 @@ namespace SlimeImuProtocol.SlimeProtocol {
             if (_ready)
             {
                 _currentAcceleration = a;
-                _udpHandler?.SetSensorAcceleration(a, 0);
+                _udpHandler?.SetSensorAccelerationSync(a, 0);
             }
         }
 
@@ -128,14 +141,25 @@ namespace SlimeImuProtocol.SlimeProtocol {
             {
                 _currentRotation = rotation;
                 _currentAcceleration = acceleration;
-                _udpHandler?.SetSensorBundle(rotation, acceleration, 0);
+                var sw = Stopwatch.StartNew();
+                _udpHandler?.SetSensorBundleSync(rotation, acceleration, 0);
+                sw.Stop();
+                Interlocked.Add(ref _totalSetBundleTicks, sw.ElapsedTicks);
+                int c = Interlocked.Increment(ref _bundleCount);
+                if (c >= 200)
+                {
+                    double avgMs = (_totalSetBundleTicks / (double)c) / TimeSpan.TicksPerMillisecond;
+                    Console.WriteLine($"[PERF] SetBundleSync avg {avgMs:F3} ms over {c}");
+                    Interlocked.Exchange(ref _totalSetBundleTicks, 0);
+                    Interlocked.Exchange(ref _bundleCount, 0);
+                }
             }
         }
 
         public void SetMagVector(Vector3 m) {
             if (_ready)
             {
-                _udpHandler?.SetSensorMagnetometer(m, 0);
+                _udpHandler?.SetSensorMagnetometerSync(m, 0);
             }
         }
 

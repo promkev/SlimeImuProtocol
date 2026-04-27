@@ -60,6 +60,28 @@ namespace SlimeImuProtocol.SlimeVR
         /// Unified send path. Counts success/failure so UI diagnostics don't lie. Callers use
         /// this instead of udpClient.SendAsync directly.
         /// </summary>
+        /// <summary>
+        /// Synchronous send path for hot data loops (HID reader threads). UDP datagram sends
+        /// are non-blocking so the async machinery is pure overhead. Lock protects against
+        /// concurrent ConfigureUdp swap. Callers that fire from threads must use this path.
+        /// </summary>
+        private void SendInternalSync(byte[] payload)
+        {
+            if (disposed) return;
+            UdpClient client;
+            lock (_udpClientLock) { client = udpClient; }
+            if (client == null) return;
+            try
+            {
+                client.Send(payload);
+                System.Threading.Interlocked.Increment(ref _packetsSent);
+            }
+            catch
+            {
+                System.Threading.Interlocked.Increment(ref _sendFailures);
+            }
+        }
+
         private async Task SendInternal(ReadOnlyMemory<byte> payload)
         {
             if (disposed) return;
@@ -352,34 +374,49 @@ namespace SlimeImuProtocol.SlimeVR
             }
         }
 
-        public async Task<bool> SetSensorRotation(Quaternion rotation, byte trackerId)
+        public void SetSensorRotationSync(Quaternion rotation, byte trackerId)
         {
             if (udpClient != null && _isInitialized)
             {
-                await SendInternal(packetBuilder.BuildRotationPacket(rotation, trackerId));
+                SendInternalSync(packetBuilder.BuildRotationPacket(rotation, trackerId));
                 _lastQuaternion = rotation;
             }
-            return true;
         }
 
-        public static bool QuatEqualsWithEpsilon(Quaternion a, Quaternion b)
-        {
-            const float epsilon = 0.0001f;
-            return MathF.Abs(a.X - b.X) < epsilon
-                && MathF.Abs(a.Y - b.Y) < epsilon
-                && MathF.Abs(a.Z - b.Z) < epsilon
-                && MathF.Abs(a.W - b.W) < epsilon;
-        }
-
-        public async Task<bool> SetSensorAcceleration(Vector3 acceleration, byte trackerId)
+        public void SetSensorAccelerationSync(Vector3 acceleration, byte trackerId)
         {
             if (udpClient != null && _isInitialized)
             {
-                await SendInternal(packetBuilder.BuildAccelerationPacket(acceleration, trackerId));
+                SendInternalSync(packetBuilder.BuildAccelerationPacket(acceleration, trackerId));
                 _timeSinceLastAccelerationDataPacket.Restart();
                 _lastAccelerationPacket = acceleration;
             }
-            return true;
+        }
+
+        public void SetSensorMagnetometerSync(Vector3 magnetometer, byte trackerId)
+        {
+            if (udpClient != null && _isInitialized)
+            {
+                SendInternalSync(packetBuilder.BuildMagnetometerPacket(magnetometer, trackerId));
+            }
+        }
+
+        public void SetSensorBundleSync(Quaternion rotation, Vector3 acceleration, byte trackerId)
+        {
+            if (udpClient == null || !_isInitialized) return;
+            var rot = packetBuilder.BuildRotationPacket(rotation, trackerId);
+            var acc = packetBuilder.BuildAccelerationPacket(acceleration, trackerId);
+            if (_serverSupportsBundle)
+            {
+                SendInternalSync(packetBuilder.BuildBundlePacket(rot, acc));
+            }
+            else
+            {
+                SendInternalSync(acc);
+                SendInternalSync(rot);
+            }
+            _lastQuaternion = rotation;
+            _lastAccelerationPacket = acceleration;
         }
 
         public async Task<bool> SetThumbstick(Vector2 analogueThumbstick, byte trackerId)
