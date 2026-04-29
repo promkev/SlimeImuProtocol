@@ -39,8 +39,10 @@ namespace SlimeImuProtocol.SlimeProtocol {
         public int SignalStrength { get; set; }
 
         public TrackerStatus Status = TrackerStatus.Disconnected;
-        private UDPHandler _udpHandler;
-        private bool _ready;
+        internal UDPHandler _udpHandler;
+        internal bool _ready;
+        public bool IsReady => _ready;
+        public UDPHandler Udp => _udpHandler;
         private float _batteryLevel;
         private Quaternion _currentRotation;
         private Vector3 _currentAcceleration;
